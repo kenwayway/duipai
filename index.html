@@ -557,6 +557,7 @@ function loadFile(t, file) {
   if (t.url) URL.revokeObjectURL(t.url);
   t.file = file; t.url = URL.createObjectURL(file);
   t.view = { s: 1, x: 0, y: 0 }; applyView(t);
+  t.pcm = null; t.pcmBuf = null;
   t.dur = 0; t.env = null; t.gen++;
   setErr(t, '');
   t.el.hidden = false;
@@ -827,6 +828,7 @@ function analyze(t, gen) {
     const { pcm, sr, via } = await extractAudio(t.file);
     if (gen !== t.gen) throw new Error('stale');
     t.via = via;
+    t.pcm = t === T.A ? pcm.slice() : null; t.pcmSr = sr; t.pcmBuf = null;
     t.info = (via === 'whole' ? '' : via.toUpperCase() + ' · ') + (pcm.length / sr).toFixed(1) + ' 秒';
     setChip('busy', '正在听' + t.name + '视频里的音乐…');
     const r = await job({ type: 'onset', pcm, sr }, [pcm.buffer], p => {
@@ -944,15 +946,42 @@ function ensureAudio() {
   }
   applyAudio();
 }
+// iPad lets only one video with sound play at a time and pauses the other,
+// so exactly one video is ever unmuted. For 都要, my track's sound comes from
+// the audio already decoded for alignment, played through Web Audio in step.
 function applyAudio() {
   const a = S.audio === 'A' ? 1 : S.audio === 'AB' ? 0.8 : 0;
   const b = S.audio === 'B' ? 1 : S.audio === 'AB' ? 0.8 : 0;
-  if (gainA) {
-    vA.muted = vB.muted = false;
-    gainA.gain.value = a; gainB.gain.value = b;
-  } else {
-    vA.muted = a === 0; vB.muted = b === 0;
+  const lead = S.audio === 'A' ? vA : vB, other = lead === vA ? vB : vA;
+  other.muted = true;
+  lead.muted = false;
+  if (gainA) { gainA.gain.value = a; gainB.gain.value = b; }
+  if (S.playing) S.audio === 'AB' ? startSecondary() : stopSecondary();
+}
+let sec = null;
+function stopSecondary() {
+  if (!sec) return;
+  try { sec.src.stop(); } catch (e) {}
+  sec.src.disconnect();
+  sec = null;
+}
+function startSecondary() {
+  stopSecondary();
+  const t = T.A;
+  if (S.audio !== 'AB' || !actx || !gainA || !t.pcm) return;
+  if (!t.pcmBuf) {
+    t.pcmBuf = actx.createBuffer(1, t.pcm.length, t.pcmSr);
+    t.pcmBuf.getChannelData(0).set(t.pcm);
   }
+  const rate = S.exporting ? 1 : S.rate;
+  const src = actx.createBufferSource();
+  src.buffer = t.pcmBuf;
+  src.playbackRate.value = rate;
+  src.connect(gainA);
+  const pos = vA.currentTime;
+  if (pos >= t.pcmBuf.duration) return;
+  src.start(0, pos);
+  sec = { src, pos, t0: actx.currentTime, rate };
 }
 applyAudio();
 
@@ -982,7 +1011,10 @@ async function play() {
   S.playing = true;
   refreshPlayBtn();
   loop();
-  try { await Promise.all([vA.play(), vB.play()]); }
+  try {
+    await Promise.all([vA.play(), vB.play()]);
+    if (S.playing) startSecondary();
+  }
   catch (e) {
     if (!S.playing) return;
     pause();
@@ -992,6 +1024,7 @@ async function play() {
 function pause() {
   S.playing = false;
   vA.pause(); vB.pause();
+  stopSecondary();
   refreshPlayBtn();
 }
 function togglePlay() { if (S.exporting) return; S.playing ? pause() : play(); }
@@ -1015,6 +1048,7 @@ function loop() {
     } else if (vB.playbackRate !== rate) {
       vB.playbackRate = rate;
     }
+    if (sec && Math.abs(sec.pos + (actx.currentTime - sec.t0) * sec.rate - tA) > 0.2) startSecondary();
     const r = range();
     if (tA >= r.b - 0.01 || vA.ended) {
       pause();
@@ -1041,7 +1075,7 @@ function segment(sel, onPick) {
     onPick(b.dataset.v);
   });
 }
-segment('#segRate', v => { S.rate = parseFloat(v); if (S.playing) { vA.playbackRate = vB.playbackRate = S.rate; } });
+segment('#segRate', v => { S.rate = parseFloat(v); if (S.playing) { vA.playbackRate = vB.playbackRate = S.rate; startSecondary(); } });
 segment('#segAudio', v => { S.audio = v; applyAudio(); });
 $('#swapBtn').addEventListener('click', () => $('#stage').classList.toggle('swap'));
 $('#setIn').addEventListener('click', () => { S.tIn = vA.currentTime; if (S.tOut != null && S.tOut <= S.tIn + 0.2) S.tOut = null; refreshAll(); });
