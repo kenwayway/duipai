@@ -220,6 +220,7 @@ kbd{font-family:var(--mono);font-size:11.5px;border:1px solid var(--line);border
       <span class="grow"></span>
       <button class="btn" type="button" id="realignBtn" disabled>重新自动对齐</button>
     </div>
+    <div class="hint mono" id="alignDetail" hidden></div>
     <div class="row" style="align-items:baseline">
       <span class="offset mono" id="offsetLbl">±0.000 s</span>
       <span class="muted" id="offsetExplain">两个视频从同一时刻开始</span>
@@ -416,6 +417,12 @@ worker.onmessage = e => {
   jobs.delete(m.id);
   m.type === 'error' ? j.reject(new Error(m.message)) : j.resolve(m);
 };
+worker.onerror = e => {
+  e.preventDefault && e.preventDefault();
+  const err = new Error('分析程序崩了' + (e.message ? '：' + e.message : '（可能内存不够）'));
+  for (const j of jobs.values()) j.reject(err);
+  jobs.clear();
+};
 function job(msg, transfer, onProgress) {
   const id = ++jobSeq;
   return new Promise((resolve, reject) => {
@@ -426,8 +433,8 @@ function job(msg, transfer, onProgress) {
 
 // ---------- state ----------
 const T = {
-  A: { key: 'A', name: '我', el: $('#vA'), pane: $('#paneA'), input: $('#fileA'), file: null, url: null, dur: 0, env: null, fr: 0, analysis: null, gen: 0 },
-  B: { key: 'B', name: '老师', el: $('#vB'), pane: $('#paneB'), input: $('#fileB'), file: null, url: null, dur: 0, env: null, fr: 0, analysis: null, gen: 0 },
+  A: { key: 'A', name: '我', el: $('#vA'), pane: $('#paneA'), input: $('#fileA'), file: null, url: null, dur: 0, env: null, fr: 0, gen: 0, audio: 'idle', audioErr: '' },
+  B: { key: 'B', name: '老师', el: $('#vB'), pane: $('#paneB'), input: $('#fileB'), file: null, url: null, dur: 0, env: null, fr: 0, gen: 0, audio: 'idle', audioErr: '' },
 };
 const S = {
   d: 0,             // teacher time = my time + d
@@ -479,9 +486,8 @@ function loadFile(t, file) {
   t.el.src = t.url;
   t.el.load();
   S.aligned = false; S.tIn = S.tOut = null;
-  const gen = t.gen;
-  t.analysis = analyze(t, gen);
-  t.analysis.then(() => maybeAlign()).catch(() => {});
+  setDetail('');
+  analyze(t, t.gen);
   refreshAll();
 }
 for (const t of [T.A, T.B]) {
@@ -516,46 +522,257 @@ for (const t of [T.A, T.B]) {
   });
 }
 
+// ---------- audio extraction ----------
+const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+function decodeBuf(ab) {
+  const ctx = new OAC(1, SR, SR);
+  return new Promise((res, rej) => {
+    const p = ctx.decodeAudioData(ab, res, e => rej(e || new Error('decode')));
+    if (p && p.then) p.then(res, e => rej(e || new Error('decode')));
+  });
+}
+function toMono(buf) {
+  const len = buf.length, nch = buf.numberOfChannels;
+  const pcm = new Float32Array(len);
+  for (let c = 0; c < nch; c++) { const d = buf.getChannelData(c); for (let i = 0; i < len; i++) pcm[i] += d[i] / nch; }
+  return pcm;
+}
+async function readBytes(file, off, len) {
+  return new Uint8Array(await file.slice(off, off + len).arrayBuffer());
+}
+const fourcc = (u8, p) => String.fromCharCode(u8[p], u8[p + 1], u8[p + 2], u8[p + 3]);
+function boxes(u8, start, end) {
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength), out = [];
+  let p = start;
+  while (p + 8 <= end) {
+    let size = dv.getUint32(p), hdr = 8;
+    const type = fourcc(u8, p + 4);
+    if (size === 1) { size = dv.getUint32(p + 8) * 2 ** 32 + dv.getUint32(p + 12); hdr = 16; }
+    else if (size === 0) size = end - p;
+    if (size < hdr || p + size > end) break;
+    out.push({ type, body: p + hdr, end: p + size });
+    p += size;
+  }
+  return out;
+}
+const child = (u8, box, type) => box && boxes(u8, box.body, box.end).find(b => b.type === type);
+const descend = (u8, box, ...types) => types.reduce((b, t) => child(u8, b, t), box);
+class Final extends Error {}
+
+// Pull the audio track out of an MP4/MOV without loading the whole video into memory:
+// read only the moov index plus the audio packets, wrap AAC packets as ADTS, and decode that.
+async function isoAudio(file) {
+  let pos = 0, moov = null;
+  while (pos + 8 <= file.size) {
+    const h = await readBytes(file, pos, 16), dv = new DataView(h.buffer);
+    let size = dv.getUint32(0), hdr = 8;
+    if (size === 1) { size = dv.getUint32(8) * 2 ** 32 + dv.getUint32(12); hdr = 16; }
+    else if (size === 0) size = file.size - pos;
+    if (size < hdr) break;
+    if (fourcc(h, 4) === 'moov') {
+      if (size > 200 * 1048576) throw new Error('索引太大');
+      moov = await readBytes(file, pos, size);
+      break;
+    }
+    pos += size;
+  }
+  if (!moov) throw new Error('找不到视频索引');
+  const dv = new DataView(moov.buffer);
+  const u64 = p => dv.getUint32(p) * 2 ** 32 + dv.getUint32(p + 4);
+  const i64 = p => dv.getInt32(p) * 2 ** 32 + dv.getUint32(p + 4);
+  const root = boxes(moov, 0, moov.length)[0];
+  const mvhd = child(moov, root, 'mvhd');
+  const movieTS = mvhd ? dv.getUint32(mvhd.body + (moov[mvhd.body] === 1 ? 20 : 12)) : 1000;
+
+  const trak = boxes(moov, root.body, root.end).filter(b => b.type === 'trak').find(tk => {
+    const hdlr = descend(moov, tk, 'mdia', 'hdlr');
+    return hdlr && fourcc(moov, hdlr.body + 8) === 'soun';
+  });
+  if (!trak) throw new Final('视频里没有声音轨道');
+  const mdia = child(moov, trak, 'mdia');
+  const mdhd = child(moov, mdia, 'mdhd');
+  const mediaTS = dv.getUint32(mdhd.body + (moov[mdhd.body] === 1 ? 20 : 12));
+  const stbl = descend(moov, mdia, 'minf', 'stbl');
+  const stsd = child(moov, stbl, 'stsd');
+  const entry = boxes(moov, stsd.body + 8, stsd.end)[0];
+  if (!entry) throw new Error('读不到声音格式');
+
+  // codec: AAC (wrap as ADTS) or MP3 (frames are self-describing)
+  let mode = null, adtsHead = null;
+  const mp3Types = ['.mp3', 'ms\u0000U'];
+  if (mp3Types.includes(entry.type)) mode = 'mp3';
+  else if (entry.type === 'mp4a') {
+    let e = -1;
+    for (let i = entry.body; i + 4 <= entry.end; i++) if (fourcc(moov, i) === 'esds') { e = i + 4; break; }
+    if (e < 0) throw new Error('mp4a 缺少 esds');
+    let p = e + 4, oti = 0, asc = null;
+    const rd = () => moov[p++];
+    const len = () => { let n = 0; for (let i = 0; i < 4; i++) { const b = rd(); n = (n << 7) | (b & 0x7f); if (!(b & 0x80)) break; } return n; };
+    while (p < entry.end) {
+      const tag = rd(), l = len(), next = p + l;
+      if (tag === 3) { p += 2; const f = rd(); if (f & 0x80) p += 2; if (f & 0x40) p += rd(); if (f & 0x20) p += 2; continue; }
+      if (tag === 4) { oti = rd(); p += 12; continue; }
+      if (tag === 5) { asc = moov.slice(p, next); break; }
+      p = next;
+    }
+    if (oti === 0x6B || oti === 0x69) mode = 'mp3';
+    else if (asc) {
+      let bit = 0;
+      const get = n => { let v = 0; for (let i = 0; i < n; i++, bit++) v = (v << 1) | ((asc[bit >> 3] >> (7 - (bit & 7))) & 1); return v; };
+      const aot = () => { const o = get(5); return o === 31 ? 32 + get(6) : o; };
+      let ot = aot(), sfi = get(4);
+      if (sfi === 15) throw new Error('非标准采样率');
+      const ch = get(4);
+      if (ot === 5 || ot === 29) { if (get(4) === 15) get(24); ot = aot(); }
+      if (ot < 1 || ot > 4 || ch < 1 || ch > 7) throw new Error('不支持的 AAC 类型 ' + ot + '/' + ch);
+      mode = 'aac'; adtsHead = { profile: ot - 1, sfi, ch };
+    }
+  }
+  if (!mode) throw new Error('声音格式 ' + entry.type + ' 不认识');
+
+  // sample table → byte ranges of every audio packet
+  const stsz = child(moov, stbl, 'stsz');
+  if (!stsz) throw new Error('缺少 stsz');
+  const fixed = dv.getUint32(stsz.body + 4), n = dv.getUint32(stsz.body + 8);
+  const sizes = new Uint32Array(n);
+  for (let i = 0; i < n; i++) sizes[i] = fixed || dv.getUint32(stsz.body + 12 + 4 * i);
+  const stsc = child(moov, stbl, 'stsc');
+  const scN = dv.getUint32(stsc.body + 4);
+  const sc = [];
+  for (let i = 0; i < scN; i++) { const p = stsc.body + 8 + 12 * i; sc.push([dv.getUint32(p) - 1, dv.getUint32(p + 4)]); }
+  const co = child(moov, stbl, 'stco') || child(moov, stbl, 'co64');
+  const coN = dv.getUint32(co.body + 4), offs = [];
+  for (let i = 0; i < coN; i++) offs.push(co.type === 'co64' ? u64(co.body + 8 + 8 * i) : dv.getUint32(co.body + 8 + 4 * i));
+  const chunks = [];
+  let si = 0;
+  for (let e = 0; e < sc.length && si < n; e++) {
+    const last = e + 1 < sc.length ? sc[e + 1][0] : coN;
+    for (let c = sc[e][0]; c < last && si < n; c++) {
+      const cnt = Math.min(sc[e][1], n - si);
+      let bytes = 0; for (let k = si; k < si + cnt; k++) bytes += sizes[k];
+      chunks.push({ off: offs[c], s0: si, cnt, bytes });
+      si += cnt;
+    }
+  }
+  const hdr = mode === 'aac' ? 7 : 0;
+  let total = 0; for (let i = 0; i < n; i++) total += sizes[i] + hdr;
+  const out = new Uint8Array(total);
+  const outPos = new Float64Array(chunks.length);
+  { let q = 0; chunks.forEach((c, i) => { outPos[i] = q; q += c.bytes + hdr * c.cnt; }); }
+  let next = 0;
+  const workerFn = async () => {
+    while (next < chunks.length) {
+      const i = next++, c = chunks[i];
+      const data = await readBytes(file, c.off, c.bytes);
+      let q = outPos[i], r = 0;
+      for (let k = c.s0; k < c.s0 + c.cnt; k++) {
+        const len = sizes[k];
+        if (hdr) {
+          const fl = len + 7, h = adtsHead;
+          out[q] = 0xFF; out[q + 1] = 0xF1;
+          out[q + 2] = (h.profile << 6) | (h.sfi << 2) | ((h.ch >> 2) & 1);
+          out[q + 3] = ((h.ch & 3) << 6) | ((fl >> 11) & 3);
+          out[q + 4] = (fl >> 3) & 0xFF;
+          out[q + 5] = ((fl & 7) << 5) | 0x1F;
+          out[q + 6] = 0xFC;
+          q += 7;
+        }
+        out.set(data.subarray(r, r + len), q);
+        q += len; r += len;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: 8 }, workerFn));
+
+  // edit list: leading empty edits add silence, media_time skips encoder priming
+  let lead = 0, skip = 0;
+  const elst = descend(moov, trak, 'edts', 'elst');
+  if (elst) {
+    const v1 = moov[elst.body] === 1, cnt = dv.getUint32(elst.body + 4);
+    let p = elst.body + 8;
+    for (let i = 0; i < cnt; i++) {
+      const dur = v1 ? u64(p) : dv.getUint32(p);
+      const mt = v1 ? i64(p + 8) : dv.getInt32(p + 4);
+      p += v1 ? 20 : 12;
+      if (mt === -1) { lead += dur / movieTS; continue; }
+      skip = mt / mediaTS; break;
+    }
+  }
+  const buf = await decodeBuf(out.buffer);
+  let pcm = toMono(buf);
+  const sr = buf.sampleRate;
+  const drop = Math.min(pcm.length, Math.round(skip * sr)), pad = Math.round(lead * sr);
+  if (drop || pad) {
+    const shifted = new Float32Array(pcm.length - drop + pad);
+    shifted.set(pcm.subarray(drop), pad);
+    pcm = shifted;
+  }
+  return { pcm, sr, via: mode };
+}
+
+async function extractAudio(file) {
+  const head = await readBytes(file, 0, 12);
+  let firstErr = null;
+  if (['ftyp', 'moov', 'mdat', 'wide', 'free', 'skip', 'pnot'].includes(fourcc(head, 4))) {
+    try { return await isoAudio(file); }
+    catch (e) { if (e instanceof Final) throw e; firstErr = e; }
+  }
+  const why = firstErr ? firstErr.message + '；' : '';
+  if (file.size > 900 * 1048576) throw new Error(why + '文件太大（' + Math.round(file.size / 1048576) + ' MB），整段读进内存会崩');
+  try {
+    const buf = await decodeBuf(await file.arrayBuffer());
+    return { pcm: toMono(buf), sr: buf.sampleRate, via: 'whole' };
+  } catch (e) {
+    throw new Error(why + '浏览器解不开这段声音' + (e && e.message ? '（' + e.message + '）' : ''));
+  }
+}
+
 // ---------- audio analysis ----------
 let decodeChain = Promise.resolve();
-const progress = { A: 0, B: 0 };
 function analyze(t, gen) {
+  t.audio = 'busy'; t.audioErr = '';
   const run = async () => {
     if (gen !== t.gen) throw new Error('stale');
-    progress[t.key] = 0; setChip('busy', '正在听' + t.name + '视频里的音乐…');
-    const ab = await t.file.arrayBuffer();
-    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-    const ctx = new OAC(1, SR, SR);
-    let buf;
-    try {
-      buf = await new Promise((res, rej) => {
-        const p = ctx.decodeAudioData(ab, res, rej);
-        if (p && p.then) p.then(res, rej);
-      });
-    } catch (e) {
-      throw new Error('noaudio');
-    }
-    const len = buf.length, nch = buf.numberOfChannels;
-    const pcm = new Float32Array(len);
-    for (let c = 0; c < nch; c++) { const d = buf.getChannelData(c); for (let i = 0; i < len; i++) pcm[i] += d[i] / nch; }
-    const r = await job({ type: 'onset', pcm, sr: buf.sampleRate }, [pcm.buffer], p => {
-      progress[t.key] = p; setChip('busy', '正在听' + t.name + '视频里的音乐… ' + Math.round(p * 100) + '%');
+    setChip('busy', '正在取出' + t.name + '视频里的声音…');
+    const { pcm, sr, via } = await extractAudio(t.file);
+    if (gen !== t.gen) throw new Error('stale');
+    t.via = via;
+    setChip('busy', '正在听' + t.name + '视频里的音乐…');
+    const r = await job({ type: 'onset', pcm, sr }, [pcm.buffer], p => {
+      if (gen === t.gen) setChip('busy', '正在听' + t.name + '视频里的音乐… ' + Math.round(p * 100) + '%');
     });
     if (gen !== t.gen) throw new Error('stale');
     t.env = r.env; t.fr = r.fr;
     t.envDisp = displayEnv(r.env);
+    t.audio = 'ok';
     drawAll();
   };
   const p = decodeChain.then(run);
   decodeChain = p.catch(() => {});
-  p.catch(err => {
-    if (err.message === 'stale' || gen !== t.gen) return;
-    t.env = null;
-    setChip('bad', t.name + '的视频读不出声音，只能手动对齐');
+  p.then(analysisSettled, err => {
+    if (gen !== t.gen) return;
+    t.env = null; t.audio = 'fail';
+    t.audioErr = (err && err.message) || String(err);
+    analysisSettled();
+  });
+}
+function analysisSettled() {
+  const tracks = [T.A, T.B].filter(t => t.file);
+  if (tracks.some(t => t.audio === 'busy')) return;
+  const failed = tracks.filter(t => t.audio === 'fail');
+  if (failed.length) {
+    setChip('bad', failed.map(t => t.name).join('和') + '的视频读不出声音，只能手动对齐');
+    setDetail(failed.map(t => t.name + '：' + t.audioErr).join('　'));
     S.aligned = true;
     refreshAll();
-  });
-  return p;
+    return;
+  }
+  maybeAlign();
+}
+function setDetail(text) {
+  const el = $('#alignDetail');
+  el.textContent = text || '';
+  el.hidden = !text;
 }
 function displayEnv(env) {
   const s = Array.from(env).sort((a, b) => a - b);
@@ -568,6 +785,7 @@ async function maybeAlign() {
   if (!T.A.env || !T.B.env) return;
   const gA = T.A.gen, gB = T.B.gen;
   setChip('busy', '正在找两段音乐对上的位置…');
+  setDetail('');
   $('#realignBtn').disabled = true;
   try {
     const r = await job({ type: 'xcorr', a: T.A.env, b: T.B.env, fr: T.A.fr });
@@ -1013,7 +1231,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 
-window.__duipai = { T, S, setD, overlap };
+window.__duipai = { T, S, setD, overlap, extractAudio, isoAudio };
 })();
 </script>
 </body>
