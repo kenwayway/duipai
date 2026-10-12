@@ -1,5 +1,5 @@
 // App shell cache. Bump VERSION when shipping changes.
-const VERSION = 'duipai-v3';
+const VERSION = 'duipai-v4';
 const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', e => {

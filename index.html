@@ -59,8 +59,8 @@ button{cursor:pointer}
 /* stage */
 .stage{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .pane{position:relative;background:var(--screen);border-radius:14px;overflow:hidden;height:min(60vh,640px);min-height:220px;display:grid;place-items:center}
-.pane video{width:100%;height:100%;object-fit:contain;display:block;background:var(--screen)}
-.pane.mirror video{transform:scaleX(-1)}
+.pane video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block;background:var(--screen)}
+.pane video{touch-action:none;transform-origin:50% 50%;cursor:grab}
 .pane .tag{position:absolute;left:10px;top:10px;display:flex;align-items:center;gap:6px;background:rgba(0,0,0,.55);color:#fff;
   padding:4px 10px 4px 8px;border-radius:999px;font-size:13px;max-width:calc(100% - 120px);z-index:2}
 .pane .tag i{width:9px;height:9px;border-radius:50%;flex:none}
@@ -147,6 +147,7 @@ kbd{font-family:var(--mono);font-size:11.5px;border:1px solid var(--line);border
     <div class="pane me" id="paneA" data-k="A">
       <div class="tag" hidden><i></i><span>我</span></div>
       <div class="tools" hidden>
+        <button type="button" data-act="reset" hidden>复位</button>
         <button type="button" data-act="mirror" aria-pressed="false">镜像</button>
         <button type="button" data-act="replace">换</button>
       </div>
@@ -162,6 +163,7 @@ kbd{font-family:var(--mono);font-size:11.5px;border:1px solid var(--line);border
     <div class="pane teacher" id="paneB" data-k="B">
       <div class="tag" hidden><i></i><span>老师</span></div>
       <div class="tools" hidden>
+        <button type="button" data-act="reset" hidden>复位</button>
         <button type="button" data-act="mirror" aria-pressed="false">镜像</button>
         <button type="button" data-act="replace">换</button>
       </div>
@@ -210,7 +212,7 @@ kbd{font-family:var(--mono);font-size:11.5px;border:1px solid var(--line);border
       </div>
       <button class="btn" type="button" id="swapBtn">左右互换</button>
     </div>
-    <div class="hint">快捷键：<kbd>空格</kbd> 播放/暂停　<kbd>←</kbd><kbd>→</kbd> 前后 2 秒　<kbd>,</kbd><kbd>.</kbd> 老师 ∓1 帧</div>
+    <div class="hint">画面上：单指拖动挪位置，双指捏合（电脑用滚轮）缩放，点一下播放/暂停。导出会照这个取景裁。<br>快捷键：<kbd>空格</kbd> 播放/暂停　<kbd>←</kbd><kbd>→</kbd> 前后 2 秒　<kbd>,</kbd><kbd>.</kbd> 老师 ∓1 帧</div>
   </section>
 
   <section class="card" id="alignCard">
@@ -444,8 +446,8 @@ function job(msg, transfer, onProgress) {
 
 // ---------- state ----------
 const T = {
-  A: { key: 'A', name: '我', el: $('#vA'), pane: $('#paneA'), input: $('#fileA'), file: null, url: null, dur: 0, env: null, fr: 0, gen: 0, audio: 'idle', audioErr: '' },
-  B: { key: 'B', name: '老师', el: $('#vB'), pane: $('#paneB'), input: $('#fileB'), file: null, url: null, dur: 0, env: null, fr: 0, gen: 0, audio: 'idle', audioErr: '' },
+  A: { key: 'A', name: '我', el: $('#vA'), pane: $('#paneA'), input: $('#fileA'), file: null, url: null, dur: 0, env: null, fr: 0, gen: 0, audio: 'idle', audioErr: '', view: { s: 1, x: 0, y: 0 } },
+  B: { key: 'B', name: '老师', el: $('#vB'), pane: $('#paneB'), input: $('#fileB'), file: null, url: null, dur: 0, env: null, fr: 0, gen: 0, audio: 'idle', audioErr: '', view: { s: 1, x: 0, y: 0 } },
 };
 const S = {
   d: 0,             // teacher time = my time + d
@@ -475,6 +477,73 @@ const range = () => {
   return { a, b };
 };
 
+// ---------- framing: drag to move, pinch / wheel to zoom ----------
+// view.x / view.y are offsets in fractions of the pane size, view.s is the zoom.
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const isIdentity = v => Math.abs(v.s - 1) < 1e-3 && Math.abs(v.x) < 1e-3 && Math.abs(v.y) < 1e-3;
+function applyView(t) {
+  const v = t.view, mir = t.pane.classList.contains('mirror');
+  t.el.style.transform = 'translate(' + (v.x * 100) + '%,' + (v.y * 100) + '%) scale(' + v.s + ')' + (mir ? ' scaleX(-1)' : '');
+  t.pane.querySelector('[data-act=reset]').hidden = isIdentity(v);
+}
+function setView(t, s, x, y) {
+  s = clamp(s, 0.5, 6);
+  const lim = (s + 1) / 2 - 0.1;   // keep at least a sliver of the video inside the frame
+  t.view = { s, x: clamp(x, -lim, lim), y: clamp(y, -lim, lim) };
+  applyView(t);
+}
+// zoom/move so the video point that was under `from` ends up under `to` at scale s
+function anchor(t, v0, from, to, s, r) {
+  const px = (from.x - v0.x * r.width) / v0.s, py = (from.y - v0.y * r.height) / v0.s;
+  setView(t, s, (to.x - s * px) / r.width, (to.y - s * py) / r.height);
+}
+function setupFraming(t) {
+  const el = t.el, pts = new Map();
+  let g = null;
+  const local = (e, r) => ({ x: e.clientX - r.left - r.width / 2, y: e.clientY - r.top - r.height / 2 });
+  const geom = r => {
+    const ps = [...pts.values()].map(e => local(e, r));
+    if (ps.length < 2) return { m: ps[0], dist: 0 };
+    return { m: { x: (ps[0].x + ps[1].x) / 2, y: (ps[0].y + ps[1].y) / 2 }, dist: Math.hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y) };
+  };
+  const begin = () => {
+    const r = t.pane.getBoundingClientRect();
+    g = { r, ...geom(r), v: { ...t.view } };
+  };
+  el.addEventListener('pointerdown', e => {
+    if (S.exporting) return;
+    try { el.setPointerCapture(e.pointerId); } catch (err) {}
+    pts.set(e.pointerId, e);
+    if (pts.size === 1) t.tapMoved = false;
+    begin();
+  });
+  el.addEventListener('pointermove', e => {
+    if (!g || !pts.has(e.pointerId)) return;
+    pts.set(e.pointerId, e);
+    const now = geom(g.r);
+    if (!now.m) return;
+    if (!t.tapMoved && (pts.size > 1 || Math.hypot(now.m.x - g.m.x, now.m.y - g.m.y) > 6)) t.tapMoved = true;
+    if (!t.tapMoved) return;
+    const s = pts.size > 1 && g.dist > 0 ? g.v.s * now.dist / g.dist : g.v.s;
+    anchor(t, g.v, g.m, now.m, s, g.r);
+  });
+  const up = e => {
+    if (!pts.delete(e.pointerId)) return;
+    if (pts.size) begin(); else g = null;
+  };
+  el.addEventListener('pointerup', up);
+  el.addEventListener('pointercancel', up);
+  el.addEventListener('wheel', e => {
+    if (S.exporting) return;
+    e.preventDefault();
+    const r = t.pane.getBoundingClientRect(), m = local(e, r);
+    const k = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0015));
+    anchor(t, { ...t.view }, m, m, t.view.s * k, r);
+  }, { passive: false });
+  // keep iPad Safari from zooming the whole page on a pinch over the video
+  t.pane.addEventListener('gesturestart', e => e.preventDefault());
+}
+
 // ---------- loading ----------
 function setErr(t, msg) {
   const el = t.pane.querySelector('.err');
@@ -487,6 +556,7 @@ function loadFile(t, file) {
   pause();
   if (t.url) URL.revokeObjectURL(t.url);
   t.file = file; t.url = URL.createObjectURL(file);
+  t.view = { s: 1, x: 0, y: 0 }; applyView(t);
   t.dur = 0; t.env = null; t.gen++;
   setErr(t, '');
   t.el.hidden = false;
@@ -521,9 +591,12 @@ for (const t of [T.A, T.B]) {
       const on = b.getAttribute('aria-pressed') !== 'true';
       b.setAttribute('aria-pressed', String(on));
       t.pane.classList.toggle('mirror', on);
+      applyView(t);
     }
+    if (b.dataset.act === 'reset') { t.view = { s: 1, x: 0, y: 0 }; applyView(t); }
   });
-  t.el.addEventListener('click', () => togglePlay());
+  t.el.addEventListener('click', () => { if (t.tapMoved) { t.tapMoved = false; return; } togglePlay(); });
+  setupFraming(t);
   t.pane.addEventListener('dragover', e => { e.preventDefault(); t.pane.classList.add('drag'); });
   t.pane.addEventListener('dragleave', () => t.pane.classList.remove('drag'));
   t.pane.addEventListener('drop', e => {
@@ -1143,7 +1216,11 @@ function layout() {
   const swap = $('#stage').classList.contains('swap');
   const order = swap ? [T.B, T.A] : [T.A, T.B];
   let H = Math.min(1280, vA.videoHeight || 720, vB.videoHeight || 720);
-  const w = t => H * (t.el.videoWidth || 16) / (t.el.videoHeight || 9);
+  // untouched video: cell hugs the video; reframed: cell has the pane's shape, so the export matches the screen
+  const aspect = t => isIdentity(t.view)
+    ? (t.el.videoWidth || 16) / (t.el.videoHeight || 9)
+    : t.pane.clientWidth / Math.max(1, t.pane.clientHeight);
+  const w = t => H * aspect(t);
   let total = w(order[0]) + w(order[1]);
   if (total > 2560) H = H * 2560 / total;
   H = even(H);
@@ -1154,10 +1231,14 @@ function drawFrame(tA, r) {
   const g = expCtx, L = expLayout;
   g.fillStyle = '#000'; g.fillRect(0, 0, L.W, L.H);
   for (const p of L.parts) {
-    const mir = p.t.pane.classList.contains('mirror');
+    const t = p.t, v = t.view, mir = t.pane.classList.contains('mirror');
+    const vw = t.el.videoWidth || 16, vh = t.el.videoHeight || 9;
+    const c = Math.min(p.w / vw, L.H / vh) * v.s;
     g.save();
-    if (mir) { g.translate(p.x + p.w, 0); g.scale(-1, 1); g.drawImage(p.t.el, 0, 0, p.w, L.H); }
-    else g.drawImage(p.t.el, p.x, 0, p.w, L.H);
+    g.beginPath(); g.rect(p.x, 0, p.w, L.H); g.clip();
+    g.translate(p.x + p.w / 2 + v.x * p.w, L.H / 2 + v.y * L.H);
+    g.scale(mir ? -c : c, c);
+    g.drawImage(t.el, -vw / 2, -vh / 2, vw, vh);
     g.restore();
     const fs = Math.round(L.H / 28);
     g.font = '600 ' + fs + 'px ' + css('--sans');
