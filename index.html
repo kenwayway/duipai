@@ -389,6 +389,7 @@ onmessage = e => {
   try {
     if (m.type === 'onset') {
       const r = onset(m.pcm, m.sr, m.id);
+      postMessage({ type: 'progress', id: m.id, p: 1 });
       postMessage({ type: 'done', id: m.id, env: r.env, fr: r.fr }, [r.env.buffer]);
     } else if (m.type === 'xcorr') {
       postMessage({ type: 'done', id: m.id, ...xcorr(m.a, m.b, m.fr) });
@@ -426,7 +427,17 @@ worker.onerror = e => {
 function job(msg, transfer, onProgress) {
   const id = ++jobSeq;
   return new Promise((resolve, reject) => {
-    jobs.set(id, { resolve, reject, onProgress });
+    let timer = 0;
+    const arm = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { jobs.delete(id); reject(new Error('分析超时：45 秒没有动静')); }, 45000);
+    };
+    jobs.set(id, {
+      resolve: v => { clearTimeout(timer); resolve(v); },
+      reject: e => { clearTimeout(timer); reject(e); },
+      onProgress: p => { arm(); onProgress && onProgress(p); },
+    });
+    arm();
     worker.postMessage({ ...msg, id }, transfer || []);
   });
 }
@@ -584,10 +595,16 @@ async function isoAudio(file) {
   const mvhd = child(moov, root, 'mvhd');
   const movieTS = mvhd ? dv.getUint32(mvhd.body + (moov[mvhd.body] === 1 ? 20 : 12)) : 1000;
 
-  const trak = boxes(moov, root.body, root.end).filter(b => b.type === 'trak').find(tk => {
+  const sound = boxes(moov, root.body, root.end).filter(b => b.type === 'trak').filter(tk => {
     const hdlr = descend(moov, tk, 'mdia', 'hdlr');
     return hdlr && fourcc(moov, hdlr.body + 8) === 'soun';
   });
+  const codecOf = tk => {
+    const sd = descend(moov, tk, 'mdia', 'minf', 'stbl', 'stsd');
+    const en = sd && boxes(moov, sd.body + 8, sd.end)[0];
+    return en ? en.type : '';
+  };
+  const trak = sound.find(tk => ['mp4a', '.mp3', 'ms\u0000U'].includes(codecOf(tk))) || sound[0];
   if (!trak) throw new Final('视频里没有声音轨道');
   const mdia = child(moov, trak, 'mdia');
   const mdhd = child(moov, mdia, 'mdhd');
@@ -737,6 +754,7 @@ function analyze(t, gen) {
     const { pcm, sr, via } = await extractAudio(t.file);
     if (gen !== t.gen) throw new Error('stale');
     t.via = via;
+    t.info = (via === 'whole' ? '' : via.toUpperCase() + ' · ') + (pcm.length / sr).toFixed(1) + ' 秒';
     setChip('busy', '正在听' + t.name + '视频里的音乐…');
     const r = await job({ type: 'onset', pcm, sr }, [pcm.buffer], p => {
       if (gen === t.gen) setChip('busy', '正在听' + t.name + '视频里的音乐… ' + Math.round(p * 100) + '%');
@@ -759,12 +777,18 @@ function analyze(t, gen) {
 function analysisSettled() {
   const tracks = [T.A, T.B].filter(t => t.file);
   if (tracks.some(t => t.audio === 'busy')) return;
+  setDetail(tracks.filter(t => t.audio === 'ok').map(t => t.name + '：' + t.info).join('　'));
   const failed = tracks.filter(t => t.audio === 'fail');
   if (failed.length) {
     setChip('bad', failed.map(t => t.name).join('和') + '的视频读不出声音，只能手动对齐');
     setDetail(failed.map(t => t.name + '：' + t.audioErr).join('　'));
     S.aligned = true;
     refreshAll();
+    return;
+  }
+  const missing = [T.A, T.B].find(t => !t.file);
+  if (missing) {
+    setChip('good', tracks.map(t => t.name).join('和') + '的音乐听好了，还差' + (missing === T.A ? '你' : '老师') + '的视频');
     return;
   }
   maybeAlign();
@@ -785,7 +809,6 @@ async function maybeAlign() {
   if (!T.A.env || !T.B.env) return;
   const gA = T.A.gen, gB = T.B.gen;
   setChip('busy', '正在找两段音乐对上的位置…');
-  setDetail('');
   $('#realignBtn').disabled = true;
   try {
     const r = await job({ type: 'xcorr', a: T.A.env, b: T.B.env, fr: T.A.fr });
@@ -991,7 +1014,7 @@ function refreshAll() {
   $('#offsetExplain').textContent =
     Math.abs(d) < 0.0005 ? '两个视频从同一时刻开始' :
     d > 0 ? '老师的视频开头多出 ' + d.toFixed(2) + ' 秒' : '你的视频开头多出 ' + (-d).toFixed(2) + ' 秒';
-  if (!T.A.file || !T.B.file) {
+  if ((!T.A.file || !T.B.file) && ![T.A, T.B].some(t => t.file && t.audio !== 'idle')) {
     const miss = !T.A.file && !T.B.file ? '先放两个视频进来' : !T.A.file ? '还差你的视频' : '还差老师的视频';
     setChip('', miss);
   }
