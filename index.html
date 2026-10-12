@@ -980,10 +980,14 @@ async function play() {
   const rate = S.exporting ? 1 : S.rate;
   vA.playbackRate = vB.playbackRate = rate;
   S.playing = true;
-  try { await Promise.all([vA.play(), vB.play()]); }
-  catch (e) { S.playing = false; vA.pause(); vB.pause(); }
   refreshPlayBtn();
   loop();
+  try { await Promise.all([vA.play(), vB.play()]); }
+  catch (e) {
+    if (!S.playing) return;
+    pause();
+    if (S.exporting) abortExport('视频没法开始播放（' + (e.name || e.message) + '）');
+  }
 }
 function pause() {
   S.playing = false;
@@ -1018,7 +1022,10 @@ function loop() {
       else seekTo(r.a);
       return;
     }
-    if (S.exporting) drawFrame(tA, r);
+    if (S.exporting) {
+      try { drawFrame(tA, r); lastDraw = performance.now(); }
+      catch (e) { abortExport('画面合成出错：' + (e.message || e)); return; }
+    }
     refreshTime(tA);
     drawZoom();
     raf = requestAnimationFrame(tick);
@@ -1256,12 +1263,46 @@ function drawFrame(tA, r) {
   g.fillRect(L.parts[1].x - 1, 0, 2, L.H);
   $('#exportBar div').style.width = Math.min(100, (tA - r.a) / (r.b - r.a) * 100) + '%';
 }
+// iOS only starts media from inside the tap itself; touching play() now unlocks later calls
+function unlockMedia() {
+  for (const v of [vA, vB]) {
+    try { const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+    v.pause();
+  }
+}
+let exportError = '', watchdog = 0, lastDraw = 0, stopFallback = 0;
+function diag() {
+  const one = (n, v) => n + ' ' + (v.paused ? '暂停' : '在播') + ' rs' + v.readyState + ' t' + v.currentTime.toFixed(1);
+  return one('我', vA) + '；' + one('老师', vB) + '；声音 ' + (actx ? actx.state : '无') + '；录制 ' + (rec ? rec.state : '无');
+}
+function abortExport(msg) {
+  if (!S.exporting) return;
+  exportError = msg + '。状态：' + diag();
+  cancelled = true;
+  finishExport();
+}
+function startWatchdog() {
+  clearInterval(watchdog);
+  let lastT = vA.currentTime, still = 0;
+  lastDraw = performance.now();
+  watchdog = setInterval(() => {
+    if (!S.exporting) { clearInterval(watchdog); return; }
+    if (actx && actx.state !== 'running') actx.resume().catch(() => {});
+    still = Math.abs(vA.currentTime - lastT) < 0.01 ? still + 1 : 0;
+    lastT = vA.currentTime;
+    if (still >= 8) abortExport('视频 8 秒没往前走');
+    else if (performance.now() - lastDraw > 8000) abortExport('画面 8 秒没刷新');
+  }, 1000);
+}
+
 async function startExport() {
   if (!ready() || S.exporting) return;
   const mime = pickMime();
   if (mime === null) { $('#exportNote').textContent = '这个浏览器不支持录制视频。iPad 请更新到 iPadOS 15 以上，电脑用 Chrome 或 Safari。'; return; }
   pause();
   ensureAudio();
+  unlockMedia();
+  try { navigator.wakeLock && navigator.wakeLock.request('screen').then(l => { wakeLock = l; }, () => {}); } catch (e) {}
   expLayout = layout();
   expCanvas = document.createElement('canvas');
   expCanvas.width = expLayout.W; expCanvas.height = expLayout.H;
@@ -1276,7 +1317,7 @@ async function startExport() {
   } catch (e) {
     rec = new MediaRecorder(stream);
   }
-  chunks = []; cancelled = false;
+  chunks = []; cancelled = false; exportError = '';
   rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
   rec.onstop = onRecStop;
   S.exporting = true;
@@ -1286,23 +1327,30 @@ async function startExport() {
   $('#result').hidden = true;
   $('#exportNote').textContent = '正在录制 ' + fmt(r.b - r.a) + ' 的片段，' + expLayout.W + '×' + expLayout.H + '。别切走这个页面。';
   refreshAll();
-  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) { wakeLock = null; }
   rec.start(1000);
-  await play();
-  if (!S.playing) { cancelled = true; finishExport(); }
+  startWatchdog();
+  play();
 }
 function finishExport() {
-  if (rec && rec.state !== 'inactive') rec.stop();
+  clearInterval(watchdog);
   pause();
+  clearTimeout(stopFallback);
+  if (rec && rec.state !== 'inactive') {
+    // if the recorder never reports back, still return the page to a usable state
+    stopFallback = setTimeout(() => { if (S.exporting) { cancelled = true; exportError = exportError || '录制器没有响应'; onRecStop(); } }, 4000);
+    try { rec.stop(); } catch (e) { onRecStop(); }
+  } else onRecStop();
 }
 function onRecStop() {
+  if (!S.exporting) return;
+  clearTimeout(stopFallback);
   S.exporting = false;
   $('#cancelBtn').hidden = true;
   $('#exportBar').hidden = true;
   try { wakeLock && wakeLock.release(); } catch (e) {}
   wakeLock = null;
   if (cancelled || !chunks.length) {
-    $('#exportNote').textContent = cancelled ? '已取消。' : '没有录到画面，再试一次？';
+    $('#exportNote').textContent = exportError ? '没录成：' + exportError : cancelled ? '已取消。' : '没有录到画面，再试一次？';
     refreshAll(); return;
   }
   const type = (rec.mimeType || chunks[0].type || 'video/mp4').split(';')[0];
