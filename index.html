@@ -406,7 +406,7 @@ onmessage = e => {
 (() => {
 'use strict';
 const $ = s => document.querySelector(s);
-const SR = 22050;
+const SR = 44100;   // decode rate; analysis runs at half of this
 const FRAME = 1 / 30;
 
 // ---------- worker ----------
@@ -557,7 +557,7 @@ function loadFile(t, file) {
   if (t.url) URL.revokeObjectURL(t.url);
   t.file = file; t.url = URL.createObjectURL(file);
   t.view = { s: 1, x: 0, y: 0 }; applyView(t);
-  t.pcm = null; t.pcmBuf = null;
+  t.playBuf = null;
   t.dur = 0; t.env = null; t.gen++;
   setErr(t, '');
   t.el.hidden = false;
@@ -818,6 +818,19 @@ async function extractAudio(file) {
   }
 }
 
+function makeBuffer(pcm, sr) {
+  let b;
+  try { b = new AudioBuffer({ length: pcm.length, numberOfChannels: 1, sampleRate: sr }); }
+  catch (e) { b = new OAC(1, 1, sr).createBuffer(1, pcm.length, sr); }
+  b.getChannelData(0).set(pcm);
+  return b;
+}
+function halfRate(pcm) {
+  const out = new Float32Array(pcm.length >> 1);
+  for (let i = 0; i < out.length; i++) out[i] = (pcm[2 * i] + pcm[2 * i + 1]) * 0.5;
+  return out;
+}
+
 // ---------- audio analysis ----------
 let decodeChain = Promise.resolve();
 function analyze(t, gen) {
@@ -828,10 +841,12 @@ function analyze(t, gen) {
     const { pcm, sr, via } = await extractAudio(t.file);
     if (gen !== t.gen) throw new Error('stale');
     t.via = via;
-    t.pcm = t === T.A ? pcm.slice() : null; t.pcmSr = sr; t.pcmBuf = null;
+    t.playBuf = makeBuffer(pcm, sr);
     t.info = (via === 'whole' ? '' : via.toUpperCase() + ' · ') + (pcm.length / sr).toFixed(1) + ' 秒';
     setChip('busy', '正在听' + t.name + '视频里的音乐…');
-    const r = await job({ type: 'onset', pcm, sr }, [pcm.buffer], p => {
+    const halve = sr >= 40000;
+    const an = halve ? halfRate(pcm) : pcm;
+    const r = await job({ type: 'onset', pcm: an, sr: halve ? sr / 2 : sr }, [an.buffer], p => {
       if (gen === t.gen) setChip('busy', '正在听' + t.name + '视频里的音乐… ' + Math.round(p * 100) + '%');
     });
     if (gen !== t.gen) throw new Error('stale');
@@ -910,6 +925,7 @@ function setChip(kind, text) {
 // ---------- offset ----------
 function setD(d, silent) {
   S.d = d;
+  if (S.playing) startAudio();
   const o = overlap();
   if (!S.playing && ready()) {
     const tA = Math.max(o.s, Math.min(o.e, vA.currentTime));
@@ -926,64 +942,73 @@ $('#nudge').addEventListener('click', e => {
 });
 
 // ---------- playback ----------
+// Both videos stay muted and only supply pictures. Sound comes from the audio we
+// already decoded, played through Web Audio, and the Web Audio clock is the master:
+// each video is nudged to follow it. On iPad this sidesteps three Safari rules at
+// once: one audible video at a time, play() needing the tap, and a video freezing
+// when its sound is routed into Web Audio.
+vA.muted = vB.muted = true;
 let actx = null, gainA = null, gainB = null, recDest = null;
+let sources = [];
+const clock = { running: false, p0: 0, c0: 0, rate: 1 };
+const curRate = () => S.exporting ? 1 : S.rate;
 function ensureAudio() {
-  if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+  if (actx) { if (actx.state !== 'running') actx.resume().catch(() => {}); return; }
   try {
     const AC = window.AudioContext || window.webkitAudioContext;
     actx = new AC();
-    const sA = actx.createMediaElementSource(vA), sB = actx.createMediaElementSource(vB);
     gainA = actx.createGain(); gainB = actx.createGain();
-    sA.connect(gainA); sB.connect(gainB);
     gainA.connect(actx.destination); gainB.connect(actx.destination);
     if (actx.createMediaStreamDestination) {
       recDest = actx.createMediaStreamDestination();
       gainA.connect(recDest); gainB.connect(recDest);
     }
-    if (actx.state === 'suspended') actx.resume();
+    if (actx.state !== 'running') actx.resume().catch(() => {});
   } catch (e) {
     actx = null; gainA = gainB = recDest = null;
   }
   applyAudio();
 }
-// iPad lets only one video with sound play at a time and pauses the other,
-// so exactly one video is ever unmuted. For 都要, my track's sound comes from
-// the audio already decoded for alignment, played through Web Audio in step.
 function applyAudio() {
-  const a = S.audio === 'A' ? 1 : S.audio === 'AB' ? 0.8 : 0;
-  const b = S.audio === 'B' ? 1 : S.audio === 'AB' ? 0.8 : 0;
-  const lead = S.audio === 'A' ? vA : vB, other = lead === vA ? vB : vA;
-  other.muted = true;
-  lead.muted = false;
-  if (gainA) { gainA.gain.value = a; gainB.gain.value = b; }
-  if (S.playing) S.audio === 'AB' ? startSecondary() : stopSecondary();
+  if (!gainA) return;
+  gainA.gain.value = S.audio === 'A' ? 1 : S.audio === 'AB' ? 0.8 : 0;
+  gainB.gain.value = S.audio === 'B' ? 1 : S.audio === 'AB' ? 0.8 : 0;
 }
-let sec = null;
-function stopSecondary() {
-  if (!sec) return;
-  try { sec.src.stop(); } catch (e) {}
-  sec.src.disconnect();
-  sec = null;
+function stopAudio() {
+  for (const src of sources) { try { src.stop(); } catch (e) {} src.disconnect(); }
+  sources = [];
+  clock.running = false;
 }
-function startSecondary() {
-  stopSecondary();
-  const t = T.A;
-  if (S.audio !== 'AB' || !actx || !gainA || !t.pcm) return;
-  if (!t.pcmBuf) {
-    t.pcmBuf = actx.createBuffer(1, t.pcm.length, t.pcmSr);
-    t.pcmBuf.getChannelData(0).set(t.pcm);
+// start both soundtracks at my video's current position and hand the clock to Web Audio
+function startAudio() {
+  stopAudio();
+  if (!actx || !S.playing) return;
+  const rate = curRate(), pos = vA.currentTime, now = actx.currentTime + 0.05;
+  for (const [t, g, off] of [[T.A, gainA, 0], [T.B, gainB, S.d]]) {
+    if (!t.playBuf) continue;
+    const at = pos + off;
+    if (at >= t.playBuf.duration) continue;
+    const src = actx.createBufferSource();
+    src.buffer = t.playBuf;
+    src.playbackRate.value = rate;
+    src.connect(g);
+    if (at >= 0) src.start(now, at); else src.start(now - at / rate, 0);
+    sources.push(src);
   }
-  const rate = S.exporting ? 1 : S.rate;
-  const src = actx.createBufferSource();
-  src.buffer = t.pcmBuf;
-  src.playbackRate.value = rate;
-  src.connect(gainA);
-  const pos = vA.currentTime;
-  if (pos >= t.pcmBuf.duration) return;
-  src.start(0, pos);
-  sec = { src, pos, t0: actx.currentTime, rate };
+  Object.assign(clock, { running: true, p0: pos, c0: now, rate });
 }
-applyAudio();
+const audioClock = () => clock.running && actx && actx.state === 'running';
+const masterPos = () => audioClock() ? clock.p0 + (actx.currentTime - clock.c0) * clock.rate : vA.currentTime;
+const setRate = (v, r) => { if (Math.abs(v.playbackRate - r) > 1e-3) v.playbackRate = r; };
+// nudge a video toward the wanted time; rate changes are rare and coarse on purpose
+function follow(v, want, rate, dur) {
+  if (want < 0 || want > dur) return;
+  const diff = v.currentTime - want;
+  if (Math.abs(diff) > 0.3) { v.currentTime = want; setRate(v, rate); }
+  else if (Math.abs(diff) > 0.06) setRate(v, rate * (diff > 0 ? 0.95 : 1.05));
+  else if (Math.abs(diff) < 0.02) setRate(v, rate);
+}
 
 function seekTo(tA) {
   if (!ready()) return Promise.resolve();
@@ -1006,14 +1031,16 @@ async function play() {
   const r = range();
   if (vA.currentTime < r.a - 0.05 || vA.currentTime >= r.b - 0.05) await seekTo(r.a);
   else vB.currentTime = Math.max(0, vA.currentTime + S.d);
-  const rate = S.exporting ? 1 : S.rate;
+  const rate = curRate();
   vA.playbackRate = vB.playbackRate = rate;
+  vA.muted = vB.muted = true;
   S.playing = true;
+  clock.running = false;
   refreshPlayBtn();
   loop();
   try {
     await Promise.all([vA.play(), vB.play()]);
-    if (S.playing) startSecondary();
+    if (S.playing) startAudio();
   }
   catch (e) {
     if (!S.playing) return;
@@ -1024,7 +1051,7 @@ async function play() {
 function pause() {
   S.playing = false;
   vA.pause(); vB.pause();
-  stopSecondary();
+  stopAudio();
   refreshPlayBtn();
 }
 function togglePlay() { if (S.exporting) return; S.playing ? pause() : play(); }
@@ -1035,20 +1062,11 @@ function loop() {
   cancelAnimationFrame(raf);
   const tick = () => {
     if (!S.playing) return;
-    const rate = S.exporting ? 1 : S.rate;
-    const tA = vA.currentTime;
-    const want = tA + S.d;
-    const diff = vB.currentTime - want;
-    if (want < 0 || want > T.B.dur) {
-      // teacher's clip doesn't cover this moment
-    } else if (Math.abs(diff) > 0.15) {
-      vB.currentTime = want; vB.playbackRate = rate;
-    } else if (Math.abs(diff) > 0.025) {
-      vB.playbackRate = rate * (1 - Math.max(-0.08, Math.min(0.08, diff * 1.5)));
-    } else if (vB.playbackRate !== rate) {
-      vB.playbackRate = rate;
-    }
-    if (sec && Math.abs(sec.pos + (actx.currentTime - sec.t0) * sec.rate - tA) > 0.2) startSecondary();
+    const rate = curRate();
+    const master = audioClock();
+    const tA = master ? masterPos() : vA.currentTime;
+    if (master) follow(vA, tA, rate, T.A.dur);
+    follow(vB, tA + S.d, rate, T.B.dur);
     const r = range();
     if (tA >= r.b - 0.01 || vA.ended) {
       pause();
@@ -1075,7 +1093,7 @@ function segment(sel, onPick) {
     onPick(b.dataset.v);
   });
 }
-segment('#segRate', v => { S.rate = parseFloat(v); if (S.playing) { vA.playbackRate = vB.playbackRate = S.rate; startSecondary(); } });
+segment('#segRate', v => { S.rate = parseFloat(v); if (S.playing) { vA.playbackRate = vB.playbackRate = S.rate; startAudio(); } });
 segment('#segAudio', v => { S.audio = v; applyAudio(); });
 $('#swapBtn').addEventListener('click', () => $('#stage').classList.toggle('swap'));
 $('#setIn').addEventListener('click', () => { S.tIn = vA.currentTime; if (S.tOut != null && S.tOut <= S.tIn + 0.2) S.tOut = null; refreshAll(); });
@@ -1297,13 +1315,6 @@ function drawFrame(tA, r) {
   g.fillRect(L.parts[1].x - 1, 0, 2, L.H);
   $('#exportBar div').style.width = Math.min(100, (tA - r.a) / (r.b - r.a) * 100) + '%';
 }
-// iOS only starts media from inside the tap itself; touching play() now unlocks later calls
-function unlockMedia() {
-  for (const v of [vA, vB]) {
-    try { const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
-    v.pause();
-  }
-}
 let exportError = '', watchdog = 0, lastDraw = 0, stopFallback = 0;
 function diag() {
   const one = (n, v) => n + ' ' + (v.paused ? '暂停' : '在播') + ' rs' + v.readyState + ' t' + v.currentTime.toFixed(1);
@@ -1315,13 +1326,33 @@ function abortExport(msg) {
   cancelled = true;
   finishExport();
 }
+const probe = document.createElement('canvas');
+probe.width = probe.height = 12;
+const probeCtx = probe.getContext('2d', { willReadFrequently: true });
+let frozen = { A: 0, B: 0 }, lastSig = {}, lastVT = {};
+function sampleFrozen() {
+  for (const t of [T.A, T.B]) {
+    let sig = '';
+    try {
+      probeCtx.drawImage(t.el, 0, 0, 12, 12);
+      const d = probeCtx.getImageData(0, 0, 12, 12).data;
+      let h = 0; for (let i = 0; i < d.length; i += 4) h = (h * 31 + d[i] + d[i + 1] * 7 + d[i + 2] * 13) | 0;
+      sig = String(h);
+    } catch (e) { return; }
+    const moved = Math.abs(t.el.currentTime - (lastVT[t.key] ?? -1)) > 0.3;
+    if (moved && sig === lastSig[t.key]) frozen[t.key]++;
+    lastSig[t.key] = sig; lastVT[t.key] = t.el.currentTime;
+  }
+}
 function startWatchdog() {
   clearInterval(watchdog);
+  frozen = { A: 0, B: 0 }; lastSig = {}; lastVT = {};
   let lastT = vA.currentTime, still = 0;
   lastDraw = performance.now();
   watchdog = setInterval(() => {
     if (!S.exporting) { clearInterval(watchdog); return; }
     if (actx && actx.state !== 'running') actx.resume().catch(() => {});
+    sampleFrozen();
     still = Math.abs(vA.currentTime - lastT) < 0.01 ? still + 1 : 0;
     lastT = vA.currentTime;
     if (still >= 8) abortExport('视频 8 秒没往前走');
@@ -1335,7 +1366,6 @@ async function startExport() {
   if (mime === null) { $('#exportNote').textContent = '这个浏览器不支持录制视频。iPad 请更新到 iPadOS 15 以上，电脑用 Chrome 或 Safari。'; return; }
   pause();
   ensureAudio();
-  unlockMedia();
   try { navigator.wakeLock && navigator.wakeLock.request('screen').then(l => { wakeLock = l; }, () => {}); } catch (e) {}
   expLayout = layout();
   expCanvas = document.createElement('canvas');
@@ -1402,7 +1432,9 @@ function onRecStop() {
   sb.hidden = !(navigator.canShare && navigator.canShare({ files: [file] }));
   sb.onclick = () => navigator.share({ files: [file] }).catch(() => {});
   $('#result').hidden = false;
-  $('#exportNote').textContent = '好了。iPad 上点「存到相册 / 分享」然后选「存储视频」。';
+  const stuck = [T.A, T.B].filter(t => frozen[t.key] >= 3);
+  $('#exportNote').textContent = '好了。iPad 上点「存到相册 / 分享」然后选「存储视频」。' +
+    (stuck.length ? '　注意：' + stuck.map(t => t.name + '的画面有 ' + frozen[t.key] + ' 秒没变').join('，') + '，可能冻住了，告诉我。' : '');
   refreshAll();
 }
 $('#exportBtn').addEventListener('click', startExport);
